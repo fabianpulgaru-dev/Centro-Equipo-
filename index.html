@@ -502,13 +502,21 @@ function setSyncUI(st,msg){
   b.title=msg;
 }
 function firebaseErrorMessage(err, action='conectar'){
-  console.error('Firebase:', err);
-  const code=err?.code||'error-desconocido';
-  const detail=err?.message||String(err||'');
-  if(code.includes('permission-denied')) return 'Permiso denegado: revisa las reglas de Realtime Database';
-  if(code.includes('auth')) return 'Sesión inválida: vuelve a iniciar sesión';
-  if(detail.includes('Failed to fetch')||detail.includes('ERR_NAME_NOT_RESOLVED')) return 'No se encuentra la URL de Realtime Database';
-  return `Error al ${action}: ${code}`;
+  console.error('Firebase error completo:', err);
+  const code=String(err?.code||'').trim();
+  const name=String(err?.name||'').trim();
+  const detail=String(err?.message||err||'').trim();
+  const all=(code+' '+name+' '+detail).toLowerCase();
+  if(all.includes('permission-denied')||all.includes('permission_denied'))
+    return 'Permiso denegado: revisa las reglas de Realtime Database';
+  if(all.includes('auth/')||all.includes('unauthenticated'))
+    return 'Sesión inválida: vuelve a iniciar sesión';
+  if(all.includes('failed to fetch')||all.includes('name_not_resolved')||all.includes('networkerror')||all.includes('network request failed'))
+    return 'No fue posible encontrar o alcanzar la URL de Realtime Database';
+  if(all.includes('database url')||all.includes('invalid url'))
+    return 'La URL configurada para Realtime Database no es válida';
+  const visible=[code,name,detail].filter(Boolean).join(' · ');
+  return `Error al ${action}${visible?': '+visible:': sin detalle entregado por Firebase'}`;
 }
 function snapshotForFirebase(){
   return {
@@ -560,6 +568,8 @@ function listenTeam(){
       teamData[email]=d||{projects:[],entries:[],tasks:[]};
       if(document.getElementById('view-team').style.display!=='none')renderTeamFeed();
       renderDash();updateTaskNotifBadge();
+    },err=>{
+      setSyncUI('err',firebaseErrorMessage(err,'leer datos del equipo'));
     });
   });
 }
@@ -617,7 +627,7 @@ async function loadUserData(){
   }catch(err){
     firebaseReady=false;
     setSyncUI('err',firebaseErrorMessage(err,'cargar'));
-    document.getElementById('li-err').textContent=firebaseErrorMessage(err,'cargar')+'. Abre la consola para ver el detalle.';
+    const msg=firebaseErrorMessage(err,'cargar'); document.getElementById('li-err').textContent=msg+'. URL: '+FB_CONFIG.databaseURL;
   }
   enterApp();
   if(firebaseReady)listenTeam();
