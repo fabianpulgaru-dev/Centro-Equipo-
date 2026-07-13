@@ -432,7 +432,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--t
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
-import { getDatabase, ref, set, get, onValue }
+import { getDatabase, ref, set, get, onValue, serverTimestamp }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
 
 const FB_CONFIG = {
@@ -479,6 +479,9 @@ let saveT = null, fbT = null;
 let ctxEntryId = null, ctxProjId = null;
 let editingTaskId = null;
 let tocOpen = false;
+let firebaseReady = false;
+let saveInFlight = null;
+let pendingSave = false;
 
 /* ── HELPERS ── */
 const uid  = () => Date.now().toString(36)+Math.random().toString(36).slice(2,6);
@@ -490,14 +493,65 @@ const fbk  = e  => e.replace(/[.#$[\]@]/g,'_');
 const isOverdue = task => task.due && !task.done && new Date(task.due)<new Date();
 
 /* ── SYNC ── */
-function setSyncUI(st,msg){const b=document.getElementById('sync-badge'),t=document.getElementById('sync-txt');if(!b||!t)return;b.className=st?'sync-badge '+st:'sync-badge';b.style.opacity='1';t.textContent=msg;}
-async function saveToFb(){
-  if(!CU)return;setSyncUI('syncing','Guardando…');
-  try{await set(ref(db,'centro/'+fbk(CU.email)),{projects:S.projects,entries:S.entries,tasks:S.tasks,theme:S.theme,upd:Date.now()});setSyncUI('ok','Guardado ✓');setTimeout(()=>setSyncUI('','—'),3000);}
-  catch{setSyncUI('err','Error al guardar');}
+function setSyncUI(st,msg){
+  const b=document.getElementById('sync-badge'),t=document.getElementById('sync-txt');
+  if(!b||!t)return;
+  b.className=st?'sync-badge '+st:'sync-badge';
+  b.style.opacity='1';
+  t.textContent=msg;
+  b.title=msg;
 }
-const schedFb = () => { clearTimeout(fbT); fbT=setTimeout(saveToFb,2000); };
-const save    = () => { schedFb(); };
+function firebaseErrorMessage(err, action='conectar'){
+  console.error('Firebase:', err);
+  const code=err?.code||'error-desconocido';
+  const detail=err?.message||String(err||'');
+  if(code.includes('permission-denied')) return 'Permiso denegado: revisa las reglas de Realtime Database';
+  if(code.includes('auth')) return 'Sesión inválida: vuelve a iniciar sesión';
+  if(detail.includes('Failed to fetch')||detail.includes('ERR_NAME_NOT_RESOLVED')) return 'No se encuentra la URL de Realtime Database';
+  return `Error al ${action}: ${code}`;
+}
+function snapshotForFirebase(){
+  return {
+    projects:Array.isArray(S.projects)?S.projects:[],
+    entries:Array.isArray(S.entries)?S.entries:[],
+    tasks:Array.isArray(S.tasks)?S.tasks:[],
+    theme:S.theme||'nocturno',
+    upd:serverTimestamp(),
+    ownerEmail:CU?.email||'',
+    ownerUid:auth.currentUser?.uid||''
+  };
+}
+async function saveToFb(){
+  clearTimeout(fbT);fbT=null;
+  if(!CU||!auth.currentUser)return;
+  if(!firebaseReady){
+    pendingSave=true;
+    setSyncUI('err','Firebase no está disponible');
+    return;
+  }
+  if(saveInFlight){pendingSave=true;return saveInFlight;}
+  setSyncUI('syncing','Guardando…');
+  saveInFlight=(async()=>{
+    try{
+      await set(ref(db,'centro/'+fbk(CU.email)),snapshotForFirebase());
+      setSyncUI('ok','Guardado ✓');
+      setTimeout(()=>setSyncUI('','—'),3000);
+    }catch(err){
+      pendingSave=true;
+      setSyncUI('err',firebaseErrorMessage(err,'guardar'));
+    }finally{
+      saveInFlight=null;
+      if(pendingSave&&firebaseReady){pendingSave=false;setTimeout(saveToFb,150);}
+    }
+  })();
+  return saveInFlight;
+}
+const schedFb = () => {
+  pendingSave=true;
+  clearTimeout(fbT);
+  fbT=setTimeout(()=>{pendingSave=false;saveToFb();},700);
+};
+const save = () => schedFb();
 
 function listenTeam(){
   Object.keys(TEAM).forEach(email=>{
@@ -538,13 +592,35 @@ onAuthStateChanged(auth,user=>{
   }
 });
 async function loadUserData(){
-  setSyncUI('syncing','Cargando…');
+  setSyncUI('syncing','Conectando con Firebase…');
   try{
-    const snap=await get(ref(db,'centro/'+fbk(CU.email)));const d=snap.val();
-    if(d){S.projects=d.projects||[];S.entries=d.entries||[];S.tasks=d.tasks||[];S.theme=d.theme||'nocturno';}
-    else{S.projects=[];S.entries=[];S.tasks=[];S.theme='nocturno';}
-  }catch{setSyncUI('err','Sin conexión');}
-  enterApp();listenTeam();
+    const connectedRef=ref(db,'.info/connected');
+    onValue(connectedRef,snap=>{
+      if(snap.val()===true){
+        firebaseReady=true;
+        if(pendingSave){pendingSave=false;saveToFb();}
+      }else{
+        firebaseReady=false;
+        setSyncUI('err','Firebase sin conexión');
+      }
+    });
+    const snap=await get(ref(db,'centro/'+fbk(CU.email)));
+    const d=snap.val();
+    if(d){
+      S.projects=Array.isArray(d.projects)?d.projects:Object.values(d.projects||{});
+      S.entries=Array.isArray(d.entries)?d.entries:Object.values(d.entries||{});
+      S.tasks=Array.isArray(d.tasks)?d.tasks:Object.values(d.tasks||{});
+      S.theme=d.theme||'nocturno';
+    }else{S.projects=[];S.entries=[];S.tasks=[];S.theme='nocturno';}
+    firebaseReady=true;
+    setSyncUI('ok','Firebase conectado');
+  }catch(err){
+    firebaseReady=false;
+    setSyncUI('err',firebaseErrorMessage(err,'cargar'));
+    document.getElementById('li-err').textContent=firebaseErrorMessage(err,'cargar')+'. Abre la consola para ver el detalle.';
+  }
+  enterApp();
+  if(firebaseReady)listenTeam();
 }
 function enterApp(){
   document.getElementById('login-screen').classList.add('out');document.getElementById('app').classList.add('on');
@@ -646,7 +722,8 @@ function newEntry(){
 }
 document.getElementById('d-new').addEventListener('click',newEntry);
 document.getElementById('add-entry-btn').addEventListener('click',newEntry);
-window.addEventListener('beforeunload',e=>{if(S.activeEntry&&saveT){flushSave(false);e.preventDefault();e.returnValue='';}});
+window.addEventListener('pagehide',()=>{if(S.activeEntry)flushSave(false);saveToFb();});
+window.addEventListener('beforeunload',()=>{if(S.activeEntry)flushSave(false);});
 
 /* Compartir */
 function updateShareBtn(shared){const btn=document.getElementById('share-btn');btn.className='share-toggle'+(shared?' shared':'');btn.innerHTML=`<span class="share-dot"></span>${shared?'Compartida':'Privada'}`;}
